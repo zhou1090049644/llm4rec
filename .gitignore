@@ -1,0 +1,51 @@
+# Python cache and build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Local environments and package caches
+.venv/
+venv/
+env/
+.uv-cache/
+.uv-python/
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Project outputs, checkpoints, logs, and experiment artifacts
+outputs/
+runs/
+logs/
+wandb/
+*.log
+*.pth
+*.pt
+*.ckpt
+*.bin
+*.fbin
+*.u64bin
+*.npy
+*.npz
+
+# Local datasets and generated data
+data/
+*.parquet
+*.pkl
+*.jsonl
+

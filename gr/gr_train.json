@@ -1,0 +1,42 @@
+{
+    "model_args": {
+        "from_pretrained": true,
+        "from_checkpoint": false,
+        "pretrained_path": "",
+        "checkpoint_path": "",
+        "tokenizer_path": "",
+        "se_id_space_width": "2048,2048,1024"
+    },
+    "data_args": {
+        "train_file": "train_data.json",
+        "max_seq_length": 100,
+        "max_imp_seq_length": 0,
+        "max_click_seq_length": 0,
+        "token_depth": 3,
+        "padding_side":"right",
+        "item2token_dict": "rqvae/emb_infer/sinkhorn50_gr",
+        "token2item_dict": "",
+        "response_flag": true
+    },
+    "training_args": {
+        "output_dir": "global_step_test_ep5",
+        "max_steps":80000,
+        "num_train_epochs": 1,
+        "per_device_train_batch_size": 16,
+        "save_steps": 5000,
+        "logging_steps": 100,
+        "fp16": true,
+        "resume_from_checkpoint": false,
+        "dataloader_pin_memory": false,
+        "per_device_eval_batch_size": 32,
+        "gradient_accumulation_steps": 4,
+        "dataloader_prefetch_factor": 2,
+        "dataloader_num_workers": 2,
+        "learning_rate": 1e-4,
+        "weight_decay": 0.01,
+        "save_strategy": "steps",
+        "save_total_limit": 10,
+        "logging_strategy": "steps",
+        "eval_steps": 10000
+    }
+}
