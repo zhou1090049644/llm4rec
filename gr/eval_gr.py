@@ -5,6 +5,7 @@ from collections import defaultdict
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -18,6 +19,24 @@ except ModuleNotFoundError:
 
 HIST_START = "<|hist_clk_start|>"
 HIST_END = "<|hist_clk_end|>"
+
+
+def init_distributed():
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    if world_size > 1 and not dist.is_initialized():
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+            backend = "nccl"
+        else:
+            backend = "gloo"
+        dist.init_process_group(backend=backend)
+    return rank, local_rank, world_size
+
+
+def is_main_process(rank):
+    return rank == 0
 
 
 def stream_user_sequences(json_path):
@@ -131,7 +150,23 @@ def generate_recommendations(
     return recommendations
 
 
+def reduce_counts(total, skipped, hits, world_size, device):
+    counts = torch.tensor([total, skipped, hits], dtype=torch.long, device=device)
+    if world_size > 1:
+        dist.all_reduce(counts, op=dist.ReduceOp.SUM)
+    return [int(value) for value in counts.cpu().tolist()]
+
+
+def write_rank_predictions(output_path, rank, result_rows):
+    rank_output_path = output_path.with_suffix(output_path.suffix + f".rank{rank}.jsonl")
+    with rank_output_path.open("w", encoding="utf-8") as fp:
+        for row in result_rows:
+            fp.write(json.dumps(row, ensure_ascii=False) + "\n")
+    return rank_output_path
+
+
 def evaluate(args):
+    rank, local_rank, world_size = init_distributed()
     model_args, data_args, training_args = parse_args_from_json(args.config)
 
     user_cache_path = Path(os.environ.get("USER_CACHE_PATH", Path.cwd() / "outputs"))
@@ -147,7 +182,12 @@ def evaluate(args):
     token2items = build_token2items(item2token_dict)
     model, tokenizer = load_eval_model_and_tokenizer(model_args, str(checkpoint_path))
 
-    device = torch.device(args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu"))
+    if args.device:
+        device = torch.device(args.device)
+    elif torch.cuda.is_available():
+        device = torch.device(f"cuda:{local_rank}" if world_size > 1 else "cuda")
+    else:
+        device = torch.device("cpu")
     model.to(device)
 
     total = 0
@@ -156,7 +196,16 @@ def evaluate(args):
     recalls = 0.0
     result_rows = []
 
-    for user_id, item_sequence in tqdm(stream_user_sequences(test_file), desc="Evaluating GR"):
+    iterator = enumerate(stream_user_sequences(test_file))
+    progress = tqdm(
+        iterator,
+        desc=f"Evaluating GR rank {rank}/{world_size}",
+        disable=not is_main_process(rank),
+    )
+    for row_idx, (user_id, item_sequence) in progress:
+        if row_idx % world_size != rank:
+            continue
+
         target_item = item_sequence[-1]
         history_items = item_sequence[:-1]
         if target_item not in item2token_dict:
@@ -196,6 +245,20 @@ def evaluate(args):
                 }
             )
 
+    output_path = Path(args.output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    prediction_files = []
+    if args.save_predictions:
+        rank_prediction_path = write_rank_predictions(output_path, rank, result_rows)
+        prediction_files = [str(rank_prediction_path)]
+        if world_size > 1:
+            gathered_prediction_files = [None for _ in range(world_size)]
+            dist.all_gather_object(gathered_prediction_files, str(rank_prediction_path))
+            prediction_files = gathered_prediction_files
+
+    total, skipped, hits = reduce_counts(total, skipped, hits, world_size, device)
+    recalls = float(hits)
+
     metrics = {
         "total_users": total,
         "skipped_users": skipped,
@@ -203,18 +266,22 @@ def evaluate(args):
         f"recall@{args.metric_k}": recalls / total if total else 0.0,
         "generate_num": args.generate_num,
         "candidate_top_k": args.candidate_top_k,
+        "world_size": world_size,
     }
 
-    output_path = Path(args.output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"metrics": metrics}
-    if args.save_predictions:
-        payload["predictions"] = result_rows
-    with output_path.open("w", encoding="utf-8") as fp:
-        json.dump(payload, fp, ensure_ascii=False, indent=2)
+    if is_main_process(rank):
+        payload = {"metrics": metrics}
+        if args.save_predictions:
+            payload["prediction_files"] = prediction_files
+        with output_path.open("w", encoding="utf-8") as fp:
+            json.dump(payload, fp, ensure_ascii=False, indent=2)
 
-    print(json.dumps(metrics, ensure_ascii=False, indent=2))
-    print(f"Wrote evaluation results to {output_path}")
+        print(json.dumps(metrics, ensure_ascii=False, indent=2))
+        print(f"Wrote evaluation results to {output_path}")
+
+    if world_size > 1:
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 def parse_args():
