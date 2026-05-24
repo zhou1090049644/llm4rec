@@ -15,6 +15,7 @@
         "token_depth": 3,
         "padding_side":"right",
         "item2token_dict": "rqvae/emb_infer/sinkhorn50_gr",
+        "test_file": "train_data.json",
         "token2item_dict": "",
         "response_flag": true
     },
