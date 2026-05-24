@@ -138,7 +138,9 @@ def evaluate(args):
     train_ckpt_path = Path(os.environ.get("TRAIN_CKPT_PATH", user_cache_path / "gr" / "checkpoints"))
     output_dir = args.output_dir or training_args.output_dir
     checkpoint_path = Path(args.checkpoint_path or model_args.checkpoint_path or train_ckpt_path / output_dir)
-    test_file = Path(args.test_file or data_args.test_file or user_cache_path / data_args.train_file)
+    test_file = Path(args.test_file or data_args.test_file or data_args.train_file)
+    if not test_file.is_absolute():
+        test_file = user_cache_path / test_file
     item2token_path = user_cache_path / data_args.item2token_dict
 
     item2token_dict = load_item2token_dict(str(item2token_path))
