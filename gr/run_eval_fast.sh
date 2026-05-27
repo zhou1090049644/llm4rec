@@ -1,0 +1,10 @@
+#!/bin/bash
+set -x
+
+export GR_EVAL_NPROC_PER_NODE="${GR_EVAL_NPROC_PER_NODE:-8}"
+export GR_EVAL_BATCH_SIZE="${GR_EVAL_BATCH_SIZE:-4}"
+export GR_EVAL_GENERATE_NUM="${GR_EVAL_GENERATE_NUM:-50}"
+export GR_EVAL_CANDIDATE_TOP_K="${GR_EVAL_CANDIDATE_TOP_K:-20}"
+export GR_EVAL_METRIC_K="${GR_EVAL_METRIC_K:-20}"
+
+bash "$(dirname "$0")/run_eval.sh"

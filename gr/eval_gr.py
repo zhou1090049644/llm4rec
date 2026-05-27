@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 from collections import defaultdict
+from datetime import timedelta
 from pathlib import Path
 
 import torch
@@ -31,7 +32,8 @@ def init_distributed():
             backend = "nccl"
         else:
             backend = "gloo"
-        dist.init_process_group(backend=backend)
+        timeout_hours = float(os.environ.get("GR_EVAL_DISTRIBUTED_TIMEOUT_HOURS", "12"))
+        dist.init_process_group(backend=backend, timeout=timedelta(hours=timeout_hours))
     return rank, local_rank, world_size
 
 
@@ -110,6 +112,20 @@ def generated_token_to_items(generated_token, token2items):
     return token2items.get(compact_token, [])
 
 
+def collect_recommendations(decoded_tokens, token2items, history_set, candidate_top_k):
+    recommendations = []
+    seen = set()
+    for generated_token in decoded_tokens:
+        for item_id in generated_token_to_items(generated_token, token2items):
+            if item_id in seen or item_id in history_set:
+                continue
+            recommendations.append(item_id)
+            seen.add(item_id)
+            if len(recommendations) >= candidate_top_k:
+                return recommendations
+    return recommendations
+
+
 @torch.no_grad()
 def generate_recommendations(
     model,
@@ -136,18 +152,55 @@ def generate_recommendations(
         eos_token_id=tokenizer.eos_token_id,
     )
 
-    recommendations = []
-    seen = set()
-    for output_ids in outputs:
-        generated_token = decode_generated_tokens(tokenizer, output_ids, prompt_len)
-        for item_id in generated_token_to_items(generated_token, token2items):
-            if item_id in seen or item_id in history_set:
-                continue
-            recommendations.append(item_id)
-            seen.add(item_id)
-            if len(recommendations) >= candidate_top_k:
-                return recommendations
-    return recommendations
+    decoded_tokens = [
+        decode_generated_tokens(tokenizer, output_ids, prompt_len)
+        for output_ids in outputs
+    ]
+    return collect_recommendations(decoded_tokens, token2items, history_set, candidate_top_k)
+
+
+@torch.no_grad()
+def generate_recommendations_batch(
+    model,
+    tokenizer,
+    prompts,
+    token2items,
+    history_sets,
+    generate_num,
+    max_new_tokens,
+    candidate_top_k,
+    device,
+):
+    inputs = tokenizer(
+        prompts,
+        return_tensors="pt",
+        add_special_tokens=False,
+        padding=True,
+    ).to(device)
+    prompt_len = inputs["input_ids"].shape[1]
+
+    outputs = model.generate(
+        **inputs,
+        max_new_tokens=max_new_tokens,
+        num_beams=generate_num,
+        num_return_sequences=generate_num,
+        do_sample=False,
+        early_stopping=True,
+        pad_token_id=tokenizer.pad_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+    )
+
+    batch_outputs = outputs.reshape(len(prompts), generate_num, outputs.shape[-1])
+    batch_recommendations = []
+    for output_group, history_set in zip(batch_outputs, history_sets):
+        decoded_tokens = [
+            decode_generated_tokens(tokenizer, output_ids, prompt_len)
+            for output_ids in output_group
+        ]
+        batch_recommendations.append(
+            collect_recommendations(decoded_tokens, token2items, history_set, candidate_top_k)
+        )
+    return batch_recommendations
 
 
 def reduce_counts(total, skipped, hits, world_size, device):
@@ -155,6 +208,13 @@ def reduce_counts(total, skipped, hits, world_size, device):
     if world_size > 1:
         dist.all_reduce(counts, op=dist.ReduceOp.SUM)
     return [int(value) for value in counts.cpu().tolist()]
+
+
+def warmup_distributed(world_size, device):
+    if world_size <= 1:
+        return
+    warmup = torch.zeros(1, dtype=torch.long, device=device)
+    dist.all_reduce(warmup, op=dist.ReduceOp.SUM)
 
 
 def write_rank_predictions(output_path, rank, result_rows):
@@ -189,12 +249,52 @@ def evaluate(args):
     else:
         device = torch.device("cpu")
     model.to(device)
+    warmup_distributed(world_size, device)
 
     total = 0
     skipped = 0
     hits = 0
     recalls = 0.0
     result_rows = []
+    eval_batch_size = max(1, args.eval_batch_size)
+    batch_rows = []
+
+    def flush_batch():
+        nonlocal total, hits, recalls, result_rows, batch_rows
+        if not batch_rows:
+            return
+
+        prompts = [row["prompt"] for row in batch_rows]
+        history_sets = [row["history_set"] for row in batch_rows]
+        batch_recommendations = generate_recommendations_batch(
+            model=model,
+            tokenizer=tokenizer,
+            prompts=prompts,
+            token2items=token2items,
+            history_sets=history_sets,
+            generate_num=args.generate_num,
+            max_new_tokens=data_args.token_depth,
+            candidate_top_k=args.candidate_top_k,
+            device=device,
+        )
+
+        for row, recommendations in zip(batch_rows, batch_recommendations):
+            top_k_recs = recommendations[: args.metric_k]
+            hit = int(row["target_item"] in top_k_recs)
+            total += 1
+            hits += hit
+            recalls += hit  # One held-out answer per user, so Recall@K equals Hit@K.
+
+            if args.save_predictions:
+                result_rows.append(
+                    {
+                        "user_id": row["user_id"],
+                        "target_item": row["target_item"],
+                        "recommendations": recommendations,
+                        f"hit@{args.metric_k}": hit,
+                    }
+                )
+        batch_rows = []
 
     iterator = enumerate(stream_user_sequences(test_file))
     progress = tqdm(
@@ -203,6 +303,9 @@ def evaluate(args):
         disable=not is_main_process(rank),
     )
     for row_idx, (user_id, item_sequence) in progress:
+        if args.max_eval_rows is not None and row_idx >= args.max_eval_rows:
+            break
+
         if row_idx % world_size != rank:
             continue
 
@@ -217,33 +320,18 @@ def evaluate(args):
             skipped += 1
             continue
 
-        recommendations = generate_recommendations(
-            model=model,
-            tokenizer=tokenizer,
-            prompt=prompt,
-            token2items=token2items,
-            history_set=set(history_items),
-            generate_num=args.generate_num,
-            max_new_tokens=data_args.token_depth,
-            candidate_top_k=args.candidate_top_k,
-            device=device,
+        batch_rows.append(
+            {
+                "user_id": user_id,
+                "target_item": target_item,
+                "prompt": prompt,
+                "history_set": set(history_items),
+            }
         )
+        if len(batch_rows) >= eval_batch_size:
+            flush_batch()
 
-        top_k_recs = recommendations[: args.metric_k]
-        hit = int(target_item in top_k_recs)
-        total += 1
-        hits += hit
-        recalls += hit  # One held-out answer per user, so Recall@K equals Hit@K.
-
-        if args.save_predictions:
-            result_rows.append(
-                {
-                    "user_id": user_id,
-                    "target_item": target_item,
-                    "recommendations": recommendations,
-                    f"hit@{args.metric_k}": hit,
-                }
-            )
+    flush_batch()
 
     output_path = Path(args.output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -266,6 +354,8 @@ def evaluate(args):
         f"recall@{args.metric_k}": recalls / total if total else 0.0,
         "generate_num": args.generate_num,
         "candidate_top_k": args.candidate_top_k,
+        "eval_batch_size": eval_batch_size,
+        "max_eval_rows": args.max_eval_rows,
         "world_size": world_size,
     }
 
@@ -294,6 +384,8 @@ def parse_args():
     parser.add_argument("--generate_num", type=int, default=100)
     parser.add_argument("--candidate_top_k", type=int, default=20)
     parser.add_argument("--metric_k", type=int, default=20)
+    parser.add_argument("--eval_batch_size", type=int, default=1)
+    parser.add_argument("--max_eval_rows", type=int, default=None)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--save_predictions", action="store_true")
     return parser.parse_args()
