@@ -26,7 +26,7 @@ class CustomTrainDataset(IterableDataset):
         )
 
     def _stream_json_data(self):
-        """Stream the one-user-per-line top-level JSON object built for GR."""
+        """Stream legacy user sequences or explicit history-target JSONL samples."""
         with open(self.json_path, "r", encoding="utf-8") as fp:
             for line in fp:
                 line = line.strip()
@@ -34,8 +34,20 @@ class CustomTrainDataset(IterableDataset):
                     continue
                 if line.endswith(","):
                     line = line[:-1]
-                user_data = json.loads("{" + line + "}")
-                user_id, item_sequence = next(iter(user_data.items()))
+
+                if line.startswith("{"):
+                    sample = json.loads(line)
+                    if "history" in sample and "target" in sample:
+                        history = [str(item) for item in sample["history"]]
+                        target = str(sample["target"])
+                        item_sequence = history + [target]
+                        user_id = str(sample.get("user_id", sample.get("sample_id", "")))
+                    else:
+                        user_id, item_sequence = next(iter(sample.items()))
+                else:
+                    user_data = json.loads("{" + line + "}")
+                    user_id, item_sequence = next(iter(user_data.items()))
+
                 if len(item_sequence) < 2:
                     continue
                 yield {

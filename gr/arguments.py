@@ -37,3 +37,5 @@ class DataTrainingArguments:
     padding_side: Optional[str] = field(default="right", metadata={"help": "The padding side for training"})
     response_flag: bool = field(default=True, metadata={"help": "whether to train on the target response tokens only"})
     test_file: Optional[str] = field(default=None,metadata={"help": "A csv or a json file containing the evaluation data.","required":False})
+    valid_file: Optional[str] = field(default=None,metadata={"help": "A json/jsonl file containing validation samples.","required":False})
+    candidate_file: Optional[str] = field(default=None,metadata={"help": "A text/json/jsonl file containing globally valid candidate item ids.","required":False})

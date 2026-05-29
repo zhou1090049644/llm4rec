@@ -8,14 +8,16 @@
         "se_id_space_width": "2048,2048,1024"
     },
     "data_args": {
-        "train_file": "train_data.json",
+        "train_file": "gr_train_split.jsonl",
         "max_seq_length": 100,
         "max_imp_seq_length": 0,
         "max_click_seq_length": 0,
         "token_depth": 3,
         "padding_side":"right",
         "item2token_dict": "rqvae/emb_infer/sinkhorn50_gr",
-        "test_file": "train_data.json",
+        "valid_file": "gr_valid_split.jsonl",
+        "test_file": "gr_test_split.jsonl",
+        "candidate_file": "candidate_items.txt",
         "token2item_dict": "",
         "response_flag": true
     },

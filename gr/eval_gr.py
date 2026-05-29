@@ -42,7 +42,7 @@ def is_main_process(rank):
 
 
 def stream_user_sequences(json_path):
-    """Stream the one-user-per-line JSON object format used by GR training."""
+    """Stream legacy user sequences or explicit history-target JSONL samples."""
     with open(json_path, "r", encoding="utf-8") as fp:
         for line in fp:
             line = line.strip()
@@ -50,10 +50,51 @@ def stream_user_sequences(json_path):
                 continue
             if line.endswith(","):
                 line = line[:-1]
-            user_data = json.loads("{" + line + "}")
-            user_id, item_sequence = next(iter(user_data.items()))
-            if len(item_sequence) >= 2:
-                yield str(user_id), [str(item) for item in item_sequence]
+            if line.startswith("{"):
+                sample = json.loads(line)
+                if "history" in sample and "target" in sample:
+                    history = [str(item) for item in sample["history"]]
+                    target = str(sample["target"])
+                    user_id = str(sample.get("user_id", sample.get("sample_id", "")))
+                    sample_id = str(sample.get("sample_id", user_id))
+                    if history and target:
+                        yield sample_id, user_id, history, target
+                else:
+                    user_id, item_sequence = next(iter(sample.items()))
+                    if len(item_sequence) >= 2:
+                        yield str(user_id), str(user_id), [str(item) for item in item_sequence[:-1]], str(item_sequence[-1])
+            else:
+                user_data = json.loads("{" + line + "}")
+                user_id, item_sequence = next(iter(user_data.items()))
+                if len(item_sequence) >= 2:
+                    yield str(user_id), str(user_id), [str(item) for item in item_sequence[:-1]], str(item_sequence[-1])
+
+
+def load_candidate_items(candidate_path):
+    if not candidate_path:
+        return None
+
+    candidate_path = Path(candidate_path)
+    candidates = set()
+    with candidate_path.open("r", encoding="utf-8") as fp:
+        for line in fp:
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith("{"):
+                sample = json.loads(line)
+                if "item_id" in sample:
+                    candidates.add(str(sample["item_id"]))
+                elif "item" in sample:
+                    candidates.add(str(sample["item"]))
+                else:
+                    candidates.update(str(value) for value in sample.values())
+            elif line.startswith("["):
+                candidates.update(str(item) for item in json.loads(line))
+            else:
+                candidates.add(line.split()[0])
+    print("length of candidate_items is:", len(candidates))
+    return candidates
 
 
 def build_token2items(item2token_dict):
@@ -112,12 +153,14 @@ def generated_token_to_items(generated_token, token2items):
     return token2items.get(compact_token, [])
 
 
-def collect_recommendations(decoded_tokens, token2items, history_set, candidate_top_k):
+def collect_recommendations(decoded_tokens, token2items, history_set, candidate_top_k, candidate_items=None):
     recommendations = []
     seen = set()
     for generated_token in decoded_tokens:
         for item_id in generated_token_to_items(generated_token, token2items):
             if item_id in seen or item_id in history_set:
+                continue
+            if candidate_items is not None and item_id not in candidate_items:
                 continue
             recommendations.append(item_id)
             seen.add(item_id)
@@ -136,6 +179,7 @@ def generate_recommendations(
     generate_num,
     max_new_tokens,
     candidate_top_k,
+    candidate_items,
     device,
 ):
     inputs = tokenizer(prompt, return_tensors="pt", add_special_tokens=False).to(device)
@@ -156,7 +200,7 @@ def generate_recommendations(
         decode_generated_tokens(tokenizer, output_ids, prompt_len)
         for output_ids in outputs
     ]
-    return collect_recommendations(decoded_tokens, token2items, history_set, candidate_top_k)
+    return collect_recommendations(decoded_tokens, token2items, history_set, candidate_top_k, candidate_items)
 
 
 @torch.no_grad()
@@ -169,6 +213,7 @@ def generate_recommendations_batch(
     generate_num,
     max_new_tokens,
     candidate_top_k,
+    candidate_items,
     device,
 ):
     inputs = tokenizer(
@@ -198,13 +243,13 @@ def generate_recommendations_batch(
             for output_ids in output_group
         ]
         batch_recommendations.append(
-            collect_recommendations(decoded_tokens, token2items, history_set, candidate_top_k)
+            collect_recommendations(decoded_tokens, token2items, history_set, candidate_top_k, candidate_items)
         )
     return batch_recommendations
 
 
-def reduce_counts(total, skipped, hits, world_size, device):
-    counts = torch.tensor([total, skipped, hits], dtype=torch.long, device=device)
+def reduce_counts(values, world_size, device):
+    counts = torch.tensor(values, dtype=torch.long, device=device)
     if world_size > 1:
         dist.all_reduce(counts, op=dist.ReduceOp.SUM)
     return [int(value) for value in counts.cpu().tolist()]
@@ -228,6 +273,11 @@ def write_rank_predictions(output_path, rank, result_rows):
 def evaluate(args):
     rank, local_rank, world_size = init_distributed()
     model_args, data_args, training_args = parse_args_from_json(args.config)
+    metric_ks = sorted({int(k.strip()) for k in args.metric_ks.split(",") if k.strip()})
+    if args.metric_k not in metric_ks:
+        metric_ks.append(args.metric_k)
+        metric_ks = sorted(set(metric_ks))
+    max_metric_k = max(metric_ks)
 
     user_cache_path = Path(os.environ.get("USER_CACHE_PATH", Path.cwd() / "outputs"))
     train_ckpt_path = Path(os.environ.get("TRAIN_CKPT_PATH", user_cache_path / "gr" / "checkpoints"))
@@ -237,9 +287,13 @@ def evaluate(args):
     if not test_file.is_absolute():
         test_file = user_cache_path / test_file
     item2token_path = user_cache_path / data_args.item2token_dict
+    candidate_path = Path(args.candidate_file or data_args.candidate_file) if (args.candidate_file or data_args.candidate_file) else None
+    if candidate_path is not None and not candidate_path.is_absolute():
+        candidate_path = user_cache_path / candidate_path
 
     item2token_dict = load_item2token_dict(str(item2token_path))
     token2items = build_token2items(item2token_dict)
+    candidate_items = load_candidate_items(str(candidate_path)) if candidate_path else None
     model, tokenizer = load_eval_model_and_tokenizer(model_args, str(checkpoint_path))
 
     if args.device:
@@ -253,14 +307,14 @@ def evaluate(args):
 
     total = 0
     skipped = 0
-    hits = 0
-    recalls = 0.0
+    target_not_in_candidate = 0
+    hit_counts = {k: 0 for k in metric_ks}
     result_rows = []
     eval_batch_size = max(1, args.eval_batch_size)
     batch_rows = []
 
     def flush_batch():
-        nonlocal total, hits, recalls, result_rows, batch_rows
+        nonlocal total, target_not_in_candidate, result_rows, batch_rows
         if not batch_rows:
             return
 
@@ -274,24 +328,31 @@ def evaluate(args):
             history_sets=history_sets,
             generate_num=args.generate_num,
             max_new_tokens=data_args.token_depth,
-            candidate_top_k=args.candidate_top_k,
+            candidate_top_k=max(args.candidate_top_k, max_metric_k),
+            candidate_items=candidate_items,
             device=device,
         )
 
         for row, recommendations in zip(batch_rows, batch_recommendations):
-            top_k_recs = recommendations[: args.metric_k]
-            hit = int(row["target_item"] in top_k_recs)
             total += 1
-            hits += hit
-            recalls += hit  # One held-out answer per user, so Recall@K equals Hit@K.
+            if candidate_items is not None and row["target_item"] not in candidate_items:
+                target_not_in_candidate += 1
+
+            row_hits = {}
+            for metric_k in metric_ks:
+                hit = int(row["target_item"] in recommendations[:metric_k])
+                hit_counts[metric_k] += hit
+                row_hits[f"hit@{metric_k}"] = hit
 
             if args.save_predictions:
                 result_rows.append(
                     {
+                        "sample_id": row["sample_id"],
                         "user_id": row["user_id"],
                         "target_item": row["target_item"],
                         "recommendations": recommendations,
-                        f"hit@{args.metric_k}": hit,
+                        "candidate_filtered": candidate_items is not None,
+                        **row_hits,
                     }
                 )
         batch_rows = []
@@ -302,15 +363,13 @@ def evaluate(args):
         desc=f"Evaluating GR rank {rank}/{world_size}",
         disable=not is_main_process(rank),
     )
-    for row_idx, (user_id, item_sequence) in progress:
+    for row_idx, (sample_id, user_id, history_items, target_item) in progress:
         if args.max_eval_rows is not None and row_idx >= args.max_eval_rows:
             break
 
         if row_idx % world_size != rank:
             continue
 
-        target_item = item_sequence[-1]
-        history_items = item_sequence[:-1]
         if target_item not in item2token_dict:
             skipped += 1
             continue
@@ -322,6 +381,7 @@ def evaluate(args):
 
         batch_rows.append(
             {
+                "sample_id": sample_id,
                 "user_id": user_id,
                 "target_item": target_item,
                 "prompt": prompt,
@@ -344,20 +404,30 @@ def evaluate(args):
             dist.all_gather_object(gathered_prediction_files, str(rank_prediction_path))
             prediction_files = gathered_prediction_files
 
-    total, skipped, hits = reduce_counts(total, skipped, hits, world_size, device)
-    recalls = float(hits)
+    reduced_values = reduce_counts(
+        [total, skipped, target_not_in_candidate] + [hit_counts[k] for k in metric_ks],
+        world_size,
+        device,
+    )
+    total, skipped, target_not_in_candidate = reduced_values[:3]
+    reduced_hits = dict(zip(metric_ks, reduced_values[3:]))
 
     metrics = {
         "total_users": total,
         "skipped_users": skipped,
-        f"hit@{args.metric_k}": hits / total if total else 0.0,
-        f"recall@{args.metric_k}": recalls / total if total else 0.0,
+        "target_not_in_candidate": target_not_in_candidate,
         "generate_num": args.generate_num,
-        "candidate_top_k": args.candidate_top_k,
+        "candidate_top_k": max(args.candidate_top_k, max_metric_k),
+        "candidate_file": str(candidate_path) if candidate_path else None,
+        "candidate_size": len(candidate_items) if candidate_items is not None else None,
         "eval_batch_size": eval_batch_size,
         "max_eval_rows": args.max_eval_rows,
         "world_size": world_size,
     }
+    for metric_k in metric_ks:
+        value = reduced_hits[metric_k] / total if total else 0.0
+        metrics[f"hit@{metric_k}"] = value
+        metrics[f"recall@{metric_k}"] = value
 
     if is_main_process(rank):
         payload = {"metrics": metrics}
@@ -384,9 +454,11 @@ def parse_args():
     parser.add_argument("--generate_num", type=int, default=100)
     parser.add_argument("--candidate_top_k", type=int, default=20)
     parser.add_argument("--metric_k", type=int, default=20)
+    parser.add_argument("--metric_ks", type=str, default="5,10,20")
     parser.add_argument("--eval_batch_size", type=int, default=1)
     parser.add_argument("--max_eval_rows", type=int, default=None)
     parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--candidate_file", type=str, default=None)
     parser.add_argument("--save_predictions", action="store_true")
     return parser.parse_args()
 
